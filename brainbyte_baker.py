@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Brainbyte Baker",
     "author": "kyunghoon",
-    "version": (5, 0, 0),
+    "version": (6, 0, 0),
     "blender": (5, 1, 0),
     "location": "3D View > Sidebar > Bake Panel",
     "description": "Bake textures from selected objects to the active object (Selected to Active).",
@@ -26,6 +26,7 @@ from bpy.types import (
     Panel,
     PropertyGroup,
 )
+from bpy_extras.io_utils import ExportHelper
 
 
 class BakeProperties(PropertyGroup):
@@ -572,6 +573,48 @@ def inject_vector_multiply(material, target_node, input_socket_name="Vector"):
     return vm_node
 
 
+def save_datablock_channels(img, target_dir, base_name):
+    # Get raw pixel data into a NumPy array
+    # Blender pixels are always RGBA floats (0.0 to 1.0)
+    width, height = img.size
+    pixels = np.empty(width * height * 4, dtype=np.float32)
+    img.pixels.foreach_get(pixels)
+    
+    # Reshape to easily access channels: (total_pixels, 4_channels)
+    pixels = pixels.reshape((-1, 4))
+
+    # Process R, G, and B
+    channel_indices = {'_ao': 0, '_roughness': 1, '_metallic': 2}
+    
+    for suffix, idx in channel_indices.items():
+        # Grab the specific channel
+        chan_data = pixels[:, idx]
+        
+        # Create a new grayscale RGBA array: [Val, Val, Val, 1.0]
+        # This ensures the output image looks like a standard grayscale PNG
+        new_rgba = np.column_stack([
+            chan_data,           # R
+            chan_data,           # G
+            chan_data,           # B
+            np.ones_like(chan_data) # A (Fully opaque)
+        ])
+        
+        # 4. Create new Data Block and Save
+        new_img_name = f"{base_name}{suffix}"
+        new_img = bpy.data.images.new(new_img_name, width, height)
+        new_img.pixels.foreach_set(new_rgba.flatten())
+        
+        # Set file parameters and save
+        new_filename = f"{base_name.replace('.', '_')}{suffix}.png"
+        img_path = os.path.join(target_dir, new_filename)
+        
+        new_img.filepath_raw = img_path
+        new_img.file_format = 'PNG'
+        new_img.save()
+        
+        bpy.data.images.remove(new_img, do_unlink=True)
+        
+
 # Main bake operator
 class OBJECT_OT_bake_selected(Operator):
     bl_idname = "object.bake_selected"
@@ -749,7 +792,115 @@ class OBJECT_OT_bake_selected(Operator):
         bpy.data.images.remove(ao_img, do_unlink=True)
         
         return {'FINISHED'}
-    
+
+
+class OBJECT_OT_export_for_substance_painter(Operator, ExportHelper):
+    bl_idname = "object.export_for_substance_painter"
+    bl_label = "Export for Substance Painter"
+    bl_description = "Exports mesh and texture for easy import into Substance Painter'"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # ExportHelper uses this to filter files
+    filename_ext = ".fbx"
+
+    filter_glob: StringProperty(
+        default="*.fbx",
+        options={'HIDDEN'},
+        maxlen=255,
+    )
+
+
+    @classmethod
+    def poll(cls, context):
+        """Check if the operator can be executed.
+        
+        Returns:
+            bool: True if conditions are met for export
+        """
+        return (
+            context.scene is not None
+            and context.object is not None
+            and len(context.selected_objects) == 1
+            and context.selected_objects[0].type == 'MESH'
+        )
+        
+    def invoke(self, context, event):
+        # Get the object name for the filename
+        obj_name = context.active_object.name if context.active_object else "Export"
+        
+        # Check if we have a saved path in the scene
+        last_dir = context.scene.get("last_fbx_path", "")
+        
+        if last_dir and os.path.exists(last_dir):
+            # If we have a last folder, combine it with the object name
+            self.filepath = os.path.join(last_dir, obj_name + self.filename_ext)
+        else:
+            # Fallback to current blend file directory or home
+            default_dir = bpy.path.abspath("//") or os.path.expanduser("~")
+            self.filepath = os.path.join(default_dir, obj_name + self.filename_ext)
+        
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+        
+    def execute(self, context):
+        
+        # Save the directory for next time before exporting
+        context.scene["last_fbx_path"] = os.path.dirname(self.filepath)
+        
+        output_path = os.path.expanduser(self.filepath)
+        
+        export_obj = context.active_object
+        
+        # Export Textures from Memory
+        suffix_map = {
+            "_DIFFUSE": "_diffuse",
+            "_NORMAL": "_normal",
+            #"_ROUGHNESS": "_roughness",
+            #"_METALLIC": "_metallic",
+            #"_AO": "_ao",
+            "_ORM": "_orm"
+        }
+        target_dir = os.path.dirname(self.filepath)
+        base_name = export_obj.active_material.name if export_obj.active_material else export_obj.name
+        for img in bpy.data.images:
+            for img in bpy.data.images:
+                if img.name.startswith(export_obj.name):
+                    original_suffix = img.name[len(export_obj.name):]
+                    if original_suffix == '_ORM':
+                        save_datablock_channels(img, target_dir, base_name.replace('.', '_'))
+                    else:
+                        clean_suffix = suffix_map.get(original_suffix, original_suffix.lower())
+                        new_filename = f"{base_name.replace('.', '_')}{clean_suffix}.png"
+                        img_path = os.path.join(target_dir, new_filename)
+                        
+                        # save_render allows us to specify the path for packed or memory images
+                        img.save_render(img_path)
+            
+        # Run the export operator
+        bpy.ops.export_scene.fbx(
+            filepath=output_path,
+            check_existing=True,
+            use_selection=True,     # Set to True to only export selected objects
+            global_scale=1.0,
+            apply_unit_scale=True,
+            apply_scale_options='FBX_SCALE_ALL',
+            bake_space_transform=True,
+            object_types={'MESH'}, # Only export geometry and bones
+            use_mesh_modifiers=True, # Apply your modifiers (Subsurf, etc.) during export
+            mesh_smooth_type='OFF',
+            use_subsurf=False,
+            #use_armature_deform_only=True,
+            #add_leaf_bones=False,    # Highly recommended for Game Engines to keep bones clean
+            axis_forward='-Y',       # Standard for Unreal/Unity/Substance
+            axis_up='Z'
+        )
+                
+        self.report({'INFO'}, f"export complete!")
+        
+        # ${MATERIAL_NAME)_normal
+        return {'FINISHED'}
+        
+        
 # Panel in sidebar
 class BAKE_PT_panel(Panel):
     bl_label = "Bake Selected to Active"
@@ -757,7 +908,7 @@ class BAKE_PT_panel(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Brainbyte Baker"
-
+    
     def draw(self, context):
         """Draw the UI panel for bake settings"""
         layout = self.layout
@@ -789,11 +940,16 @@ class BAKE_PT_panel(Panel):
         row = layout.row()
         row.scale_y = 1.3
         row.operator("object.bake_selected", icon='RENDER_STILL')
+        
+        row = layout.row()
+        row.scale_y = 1.3
+        row.operator("object.export_for_substance_painter", icon='RENDER_STILL')
 
 
 classes = (
     BakeProperties,
     OBJECT_OT_bake_selected,
+    OBJECT_OT_export_for_substance_painter,
     BAKE_PT_panel,
 )
 
