@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Brainbyte Baker",
     "author": "kyunghoon",
-    "version": (6, 0, 0),
+    "version": (9, 0, 0),
     "blender": (5, 1, 0),
     "location": "3D View > Sidebar > Bake Panel",
     "description": "Bake textures from selected objects to the active object (Selected to Active).",
@@ -199,11 +199,13 @@ def restore_bsdf_connection(bsdf_node, input_name):
             bsdf_output = bsdf_node.outputs.get('BSDF') or bsdf_node.outputs[0]
             links.new(bsdf_output, surface_input)
 
+import bpy
 
 def ensure_uv_map(obj):
     """Ensure the object has a UV map, creating one if necessary.
     
     If no UV map exists, creates a new one and performs smart UV projection.
+    Maintains and restores the user's multi-selection setup upon completion.
     
     Args:
         obj: Blender object to ensure UV map for
@@ -211,25 +213,45 @@ def ensure_uv_map(obj):
     Returns:
         The UV layer object
     """
+    # 1. CACHE ORIGINAL SELECTION STATE
+    # Save what was active, and a list of all objects the user had selected
+    original_active = bpy.context.view_layer.objects.active
+    original_selected = list(bpy.context.selected_objects)
+    
     if not obj.data.uv_layers:
         uv = obj.data.uv_layers.new(name="Bake_UV")
+        
         # Auto-unwrap if no UVs
         if obj.type == 'MESH' and obj.data.polygons:
-            # Switch to Object mode, select, unwrap
-            prev_mode = bpy.context.object.mode if bpy.context.object else 'OBJECT'
+            # Isolate the target object for unwrapping
             bpy.context.view_layer.objects.active = obj
-            bpy.ops.object.mode_set(mode='OBJECT')
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
-            bpy.context.view_layer.objects.active = obj
-            bpy.ops.uv.smart_project(angle_limit=66, island_margin=0.02, user_area_weight=1.0, use_aspect=True, stretch_to_bounds=False)
-            bpy.ops.object.mode_set(mode=prev_mode)
+            
+            # Switch to EDIT mode to run the unwrap
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            
+            # Perform the smart project (Blender 5.1+ compatible)
+            bpy.ops.uv.smart_project(angle_limit=66, island_margin=0.02)
+            
+            # Drop back to object mode safely
+            bpy.ops.object.mode_set(mode='OBJECT')
+            
+        # 2. RESTORE ORIGINAL SELECTION LAYOUT
+        bpy.ops.object.select_all(action='DESELECT')
+        for selected_obj in original_selected:
+            selected_obj.select_set(True)
+        bpy.context.view_layer.objects.active = original_active
+        
         return uv
     else:
-        # Ensure active UV layer is the first one
-        obj.data.uv_layers.active = obj.data.uv_layers[0]
+        # If UV map already exists, still ensure we drop back to object mode 
+        # and leave the user's layout completely untouched.
+        if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+            
         return obj.data.uv_layers.active
-
 
 def get_bsdf_from_mesh(obj):
     """Get the Principled BSDF node from the object's active material.
@@ -613,7 +635,27 @@ def save_datablock_channels(img, target_dir, base_name):
         new_img.save()
         
         bpy.data.images.remove(new_img, do_unlink=True)
-        
+
+def meshes_share_no_materials(obj_a, obj_b) -> bool:
+    """
+    Checks if two Blender mesh objects share any materials.
+    
+    Returns:
+        True if they share ZERO materials.
+        False if they share at least one material.
+    """
+    # Safety checks: Ensure both objects exist and are of type 'MESH'
+    if not (obj_a and obj_b and obj_a.type == 'MESH' and obj_b.type == 'MESH'):
+        raise ValueError("Both inputs must be valid Blender MESH objects.")
+
+    # Gather materials from object A (filtering out None/empty slots)
+    materials_a = {slot.material for slot in obj_a.material_slots if slot.material}
+    
+    # Gather materials from object B
+    materials_b = {slot.material for slot in obj_b.material_slots if slot.material}
+    
+    # .isdisjoint() returns True if the two sets have no elements in common
+    return materials_a.isdisjoint(materials_b)
 
 # Main bake operator
 class OBJECT_OT_bake_selected(Operator):
@@ -635,6 +677,9 @@ class OBJECT_OT_bake_selected(Operator):
             and len(context.selected_objects) > 1
             and context.selected_objects[0].type == 'MESH'
             and context.selected_objects[1].type == 'MESH'
+            and meshes_share_no_materials(
+                context.selected_objects[0],
+                context.selected_objects[1])
         )
         
     def execute(self, context):
@@ -794,10 +839,10 @@ class OBJECT_OT_bake_selected(Operator):
         return {'FINISHED'}
 
 
-class OBJECT_OT_export_for_substance_painter(Operator, ExportHelper):
-    bl_idname = "object.export_for_substance_painter"
-    bl_label = "Export for Substance Painter"
-    bl_description = "Exports mesh and texture for easy import into Substance Painter'"
+class OBJECT_OT_export_for_painting_app(Operator, ExportHelper):
+    bl_idname = "object.export_for_painting_app"
+    bl_label = "Export mesh and textures"
+    bl_description = "Exports mesh and texture for easy import into a Painting Application'"
     bl_options = {'REGISTER', 'UNDO'}
 
     # ExportHelper uses this to filter files
@@ -868,13 +913,13 @@ class OBJECT_OT_export_for_substance_painter(Operator, ExportHelper):
                     original_suffix = img.name[len(export_obj.name):]
                     if original_suffix == '_ORM':
                         save_datablock_channels(img, target_dir, base_name.replace('.', '_'))
-                    else:
-                        clean_suffix = suffix_map.get(original_suffix, original_suffix.lower())
-                        new_filename = f"{base_name.replace('.', '_')}{clean_suffix}.png"
-                        img_path = os.path.join(target_dir, new_filename)
+                    #else:
+                    clean_suffix = suffix_map.get(original_suffix, original_suffix.lower())
+                    new_filename = f"{base_name.replace('.', '_')}{clean_suffix}.png"
+                    img_path = os.path.join(target_dir, new_filename)
                         
-                        # save_render allows us to specify the path for packed or memory images
-                        img.save_render(img_path)
+                    # save_render allows us to specify the path for packed or memory images
+                    img.save_render(img_path)
             
         # Run the export operator
         bpy.ops.export_scene.fbx(
@@ -943,13 +988,13 @@ class BAKE_PT_panel(Panel):
         
         row = layout.row()
         row.scale_y = 1.3
-        row.operator("object.export_for_substance_painter", icon='RENDER_STILL')
+        row.operator("object.export_for_painting_app", icon='RENDER_STILL')
 
 
 classes = (
     BakeProperties,
     OBJECT_OT_bake_selected,
-    OBJECT_OT_export_for_substance_painter,
+    OBJECT_OT_export_for_painting_app,
     BAKE_PT_panel,
 )
 
